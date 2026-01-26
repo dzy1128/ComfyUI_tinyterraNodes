@@ -3,6 +3,7 @@ from .ttNpy import ttNserver # Do Not Remove
 import configparser
 import folder_paths
 import subprocess
+import tempfile
 import shutil
 import os
 
@@ -22,20 +23,61 @@ optionValues = {
         "enable_dev_nodes": ('true', 'false'),
     }
 
-def get_config():
-    """Return a configparser.ConfigParser object."""
-    config = configparser.ConfigParser()
-    config.read(config_path)
-    return config
+# Global config object to avoid repeated file reads
+_config_cache = None
+
+def get_config(force_reload=False):
+    """Return a configparser.ConfigParser object (cached)."""
+    global _config_cache
+    if _config_cache is None or force_reload:
+        _config_cache = configparser.ConfigParser()
+        if os.path.isfile(config_path):
+            try:
+                _config_cache.read(config_path)
+            except Exception as e:
+                print(f'\033[92m[ttNodes Config]\033[91m Failed to read config: {e}, creating new config.\033[0m')
+                _config_cache = configparser.ConfigParser()
+    return _config_cache
+
+def save_config():
+    """Save the config to file atomically."""
+    global _config_cache
+    if _config_cache is None:
+        return
+    
+    # Write to a temporary file first, then rename (atomic operation)
+    try:
+        fd, tmp_path = tempfile.mkstemp(dir=cwd_path, prefix='config_', suffix='.tmp')
+        try:
+            with os.fdopen(fd, 'w') as f:
+                _config_cache.write(f)
+            # Atomic rename (on POSIX systems)
+            shutil.move(tmp_path, config_path)
+        except Exception:
+            # Clean up temp file if rename fails
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+            raise
+    except Exception as e:
+        print(f'\033[92m[ttNodes Config]\033[91m Failed to save config: {e}\033[0m')
 
 def update_config():
-    #section > option > value
-    for node, version in TTN_VERSIONS.items():
-        config_write("Versions", node, version)
+    """Update config with default values (batch operation, single write)."""
+    config = get_config(force_reload=True)
     
+    # Write versions
+    for node, version in TTN_VERSIONS.items():
+        if not config.has_section("Versions"):
+            config.add_section("Versions")
+        config.set("Versions", str(node), str(version))
+    
+    # Write option values
     for option, value in optionValues.items():
-        config_write("Option Values", option, value)
+        if not config.has_section("Option Values"):
+            config.add_section("Option Values")
+        config.set("Option Values", str(option), str(value))
 
+    # Default section data
     section_data = {
         "ttNodes": {
             "auto_update": False,
@@ -47,23 +89,28 @@ def update_config():
         }
     }
 
+    # Write defaults only if not already set
     for section, data in section_data.items():
+        if not config.has_section(section):
+            config.add_section(section)
         for option, value in data.items():
-            if config_read(section, option) is None:
-                config_write(section, option, value)
+            if not config.has_option(section, option):
+                config.set(section, str(option), str(value))
 
-    # Load the configuration data into a dictionary.
-    config_data = config_load()
-
-    # Iterate through the configuration data.
-    for section, options in config_data.items():
+    # Remove obsolete options
+    for section in config.sections():
         if section == "Versions":
             continue
-        for option in options:
-            # If the option is not in `optionValues` or in `section_data`, remove it.
+        options_to_remove = []
+        for option in config.options(section):
             if (option not in optionValues and
                 (section not in section_data or option not in section_data[section])):
-                config_remove(section, option)
+                options_to_remove.append(option)
+        for option in options_to_remove:
+            config.remove_option(section, option)
+
+    # Single atomic write at the end
+    save_config()
 
 def config_load():
     """Load the entire configuration into a dictionary."""
@@ -76,22 +123,19 @@ def config_read(section, option):
     return config.get(section, option, fallback=None)
 
 def config_write(section, option, value):
-    """Write a configuration option."""
+    """Write a configuration option and save."""
     config = get_config()
     if not config.has_section(section):
         config.add_section(section)
     config.set(section, str(option), str(value))
-
-    with open(config_path, 'w') as f:
-        config.write(f)
+    save_config()
 
 def config_remove(section, option):
-    """Remove an option from a section."""
+    """Remove an option from a section and save."""
     config = get_config()
     if config.has_section(section):
         config.remove_option(section, option)
-        with open(config_path, 'w') as f:
-            config.write(f)
+        save_config()
 
 def config_value_validator(section, option, default):
     value = str(config_read(section, option)).lower()
